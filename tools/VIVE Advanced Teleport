@@ -1,0 +1,365 @@
+#These Sample scripts are not supported under any Autodesk standard support program or service.
+#The sample scripts are provided without warranty of any kind.
+#Autodesk disclaims all implied warranties including, without limitation, any implied warranties of merchantability or of fitness for a particular purpose.
+#The entire risk arising out of the use or performance of the sample scripts and documentation remains with you.
+
+import math, collections
+
+# Direction and rotation for teleport. Should be a list of 3 floats and one float for rotation around z (height) axis
+JumpTarget = collections.namedtuple('JumpTarget', ['xyz', 'dir'])
+JumpTarget.__new__.__defaults__ = (None,) * len(JumpTarget._fields)
+
+
+# This will be injected into the editor in VRED as a sample config
+_editor_code = '''
+
+### Teleport configuration
+selectVariantSet("VRTools_VIVE Advanced Teleport")
+tp = Teleporter()
+
+controllers = [vrOpenVRController("Controller0"), vrOpenVRController("Controller1")]
+for controller in controllers:
+    controller.connectSignal("triggerPressed", tp.show_axis, controller)
+    controller.connectSignal("touchpadPressed", tp.show_axis, controller)
+
+    controller.connectSignal("controllerMoved", tp.update_teleport, controller)
+    controller.connectSignal("triggerPressed", tp.start_teleport, controller)
+    controller.connectSignal("triggerReleased", tp.stop_teleport, controller)
+
+    controller.connectSignal("touchpadReleased", tp.raycast_tag, tp.ground_tag, controller)
+
+tp_reset_key = vrKey(Key_R)
+tp_reset_key.connect(tp.reset)
+
+'''
+
+_file = "TeleStructure.osb"
+
+
+class Teleporter():
+
+    def __init__(self, ball_mat = "_Teleport_Solid_Blue", ball_highlight_mat = "_Teleport_Solid_White", jump_min_dist = 4000, tp_name = "TelePort",
+                    ground_name = "Ground", ground_tag = "_toolkit_tp_ground", ground_list = [], show_tp_axis = True, 
+                    through_geometry = False, exclude_tag = "_toolkit_tp_exclude", exclude_list = []):
+        
+        # Minimum distance for jump points to be visible
+        self.jump_min_dist = jump_min_dist
+
+        if ball_mat:
+            self.ball_mat = findMaterial(ball_mat)
+        else:
+            self.ball_mat = createMaterial("UPlasticMaterial")
+            self.ball_mat.fields().setVec3f("diffuseColor", 0.3, 0.7, 0.3)
+        if ball_highlight_mat:
+            self.ball_highlight_mat = findMaterial(ball_highlight_mat)
+        else:
+            self.ball_highlight_mat = createMaterial("UPlasticMaterial")
+            self.ball_highlight_mat.fields().setVec3f("diffuseColor", 0.9, 0.2, 0.2)
+
+        self.tp_name = tp_name
+        self.ground_name = ground_name
+        self.ground_tag = ground_tag
+        self.ground_list = map(lambda node: node.getID(), ground_list)
+
+        self.show_tp_axis = show_tp_axis
+        self.through_geometry = through_geometry
+        self.exclude_tag = exclude_tag
+        self.exclude_list = exclude_list
+
+        self.avatar = findNode("Avatar")
+        self.tele_space = findNode("TeleSpace")
+        self.port_points = findNode("TelePortPoints")
+        self.cam_container = findNode("TeleCamContainer")
+        self.cam_rot_anchor = findNode("HmdRotAnchor")
+
+
+        # Move Perspective into cam container. We don't create a new camera you can't
+        # accidentally set Display to Vive with the wrong cam enabled
+        cam = findNode("Perspective")
+        self.cam_container.addChild(cam)
+        cam.addChild(self.cam_rot_anchor)
+
+        # Cam Container doesn't need these tags, but we need a node
+        # to attach tags to, so that the user won't need to create these
+        addNodeTags(self.cam_container, [ground_tag, exclude_tag])
+
+        self.last_jump_point = None
+        self.highlighted_jumpp = None
+
+        self.build_unwalkable_list()
+
+
+    def reset(self):
+        self.cam_container.setTranslation(0, 0, 0)
+        self.cam_container.setRotation(0, 0, 0)
+        selectCamera("Perspective")
+        setFromAtUp(-1, 0.0, 0.0, 0.0, 0, 10, 0.0, 0.0, 0.0, 1.0)
+        setOpenVRTrackingOrigin( Pnt3f(0.0, 0.0, 0.0))
+        self.build_unwalkable_list()
+
+        # Reset rotation of all keep Telepoints
+        for i in range(self.port_points.getNChildren()):
+            switch = self.port_points.getChild(i).getChild('View_Direction')
+            active_child_id = switch.fields().getInt32("choice")
+            active = switch.getChild(active_child_id)
+            if active.getName() == "Keep":
+                active.setRotation(0,0,0)
+
+
+
+    @staticmethod
+    def distance(a, b):
+        '''
+        Euclidean distance between 2 points, given as a list of floats
+        '''
+        return math.sqrt((a[0]-b[0]) ** 2 + (a[1]-b[1]) ** 2 + (a[2]-b[2]) ** 2)
+
+
+    @staticmethod
+    def child_by_name(root, name):
+        if root.getName() == name:
+            return root
+        for i in range( root.getNChildren() ):
+            child = root.getChild( i )
+            found = Teleporter.child_by_name( child, name )
+            if found:
+                return found
+        return None
+
+
+    def build_unwalkable_list(self):
+        '''
+        Builds a list of all nodes one cant walk on. Can be used for teleporting 
+        through geometry (hide everything before raycasting and show again afterwards).
+        We only try to hide geometry nodes that are visible at the moment.
+        '''
+        self.unwalkable_nodes = self.exclude_list + getNodesWithTag(self.exclude_tag)
+        if self.through_geometry:
+            self.unwalkable_nodes = self.unwalkable_nodes + [node for node in getAllNodes() 
+                if node.getName()[:len(self.ground_name)] != self.ground_name
+                or hasNodeTag(node, self.ground_tag)]
+        
+        # Always filter everything thats not geometry or not active to speed up
+        # hiding nodes before teleport raycasting
+        self.unwalkable_nodes = [node for node in self.unwalkable_nodes
+            if node.getType() == "Geometry" and node.getActive()]
+
+
+    def calc_hmd_local_pos(self):
+        '''
+        hmd local position
+        '''
+        head = getCamNode(-1).getWorldTransform()
+        cont = self.cam_container.getWorldTransform()
+
+        local_x = head[3] - cont[3]
+        local_y = head[7] - cont[7]
+        local_z = head[11] - cont[11]
+
+        return [local_x, local_y, local_z]
+
+
+    def calc_hmd_local_rot(self):
+        '''
+        hmd local rotation (difference between parent and child of cam)
+        '''
+        parent_rot = self.cam_container.getWorldRotation()
+        child_rot = self.cam_rot_anchor.getWorldRotation()
+
+        return map(lambda x, y: x - y, child_rot, parent_rot)
+
+
+    def show_axis(self, contr):
+        contr.setPickingAxis(0)
+        contr.showPickingAxis(self.show_tp_axis)
+
+
+    def jump(self, jump_target):
+        '''
+        Jump to a position and apply rotation, if there.
+        '''
+        if not jump_target:
+            return
+
+        # Subtract hmd rotation on height axis to always look in the right direction
+        if jump_target.dir:
+            old = self.cam_container.getRotation()
+            self.cam_container.setRotation(old[0], old[1], jump_target.dir)
+
+        hmd_offset = self.calc_hmd_local_pos()
+        self.cam_container.setTranslation(jump_target.xyz[0] - hmd_offset[0], jump_target.xyz[1] - hmd_offset[1], jump_target.xyz[2])
+
+
+    def start_teleport(self, contr):
+        head = self.cam_rot_anchor.getWorldTranslation()
+        self.last_jump_point = None
+
+        # TODO: This should run in a background thread to reduce lag on tp start
+        self.build_unwalkable_list()
+
+        # iterate though view point nodes and hide close-by ones
+        for i in range(self.port_points.getNChildren()):
+            point = self.port_points.getChild(i)
+            point_pos = point.getWorldTranslation()
+
+            if (self.distance(head, point_pos) < self.jump_min_dist):
+                hideNode(point)  # hide jump point close by so it is not in the way
+            else:
+                showNode(point)
+
+        showNode(self.port_points)
+        playCAnimation("_Teleport_Animation")
+
+
+    def stop_teleport(self, contr):
+        contr.showPickingAxis(False)
+        self.jump(self.last_jump_point)
+        self.avatar.setActive(false)
+        self.tele_space.setActive(false)
+        hideNode(self.port_points)
+        resetCAnimation("_Teleport_Animation")
+        if self.highlighted_jumpp:
+            self.highlight_jump_point(False)
+
+
+    def extract_direction(self, target):
+        jump = JumpTarget(xyz = target.getWorldTranslation())
+        dir_switch = target.getChild('View_Direction')
+        if not dir_switch.isValid():
+            return jump
+
+        active_child_id = dir_switch.fields().getInt32("choice")
+        active = dir_switch.getChild(active_child_id)
+        self.highlighted_jumpp = active
+
+        if active.getName() == "Direction":
+            # Set view direction and adjust for hmd rotation
+            rot = target.getRotation()
+            hmd_rot = self.calc_hmd_local_rot()
+            jump = jump._replace(dir = rot[2] - hmd_rot[2] - 90)
+
+        elif active.getName() == "Fixed":
+            # Set view direction without further adjustments
+            rot = target.getRotation()
+            jump = jump._replace(dir = rot[2])
+
+        elif active.getName() == "Viewpoint":
+            # Set view direction, adjust for hmd rotation and set height
+            own_height = self.calc_hmd_local_pos()[2]
+            jump = jump._replace(xyz = [jump.xyz[0], jump.xyz[1], jump.xyz[2] - own_height])
+
+            rot = target.getRotation()
+            hmd_rot = self.calc_hmd_local_rot()
+            jump = jump._replace(dir = rot[2] - hmd_rot[2] - 90)
+
+        elif active.getName() == "Keep":
+            # Dont adjust anything
+            pass
+            
+        return jump
+
+
+    def highlight_jump_point(self, activate, ele = None):
+        if ele == None:
+            ele = self.highlighted_jumpp
+
+        if ele.getName() == "Direction":
+            vis = self.child_by_name(ele, "TP_Switch_Dir")
+            vis.fields().setInt32("choice", int(activate))
+
+        elif ele.getName() == "Fixed":
+            vis = self.child_by_name(ele, "TP_Switch_Fixed")
+            vis.fields().setInt32("choice", int(activate))
+            if activate:
+                character = vis.getChild(vis.fields().getInt32("choice"))
+                orig_rot = character.getRotation()
+                fix_rot = ele.getWorldRotation()
+                hmd = self.calc_hmd_local_rot()
+                character.setRotation(orig_rot[0], orig_rot[1], fix_rot[0] + hmd[2] -180)
+
+        elif ele.getName() == "Viewpoint":
+            vis = self.child_by_name(ele, "Teleport_Eye_Outer")
+            if activate:
+                vis.setMaterial(self.ball_highlight_mat)
+            else:
+                vis.setMaterial(self.ball_mat)
+
+        elif ele.getName() == "Keep":
+            vis = self.child_by_name(ele, "TP_Switch_Keep")
+            vis.fields().setInt32("choice", int(activate))
+            if activate:
+                character = vis.getChild(vis.fields().getInt32("choice"))
+                orig_rot = character.getRotation()
+                character.setRotation(orig_rot[0], orig_rot[1], self.cam_rot_anchor.getWorldRotation()[2] -180)
+
+
+
+    def update_teleport(self, contr):
+        if not contr.isTriggerPressed():
+            return
+
+        cmat = contr.getWorldMatrix()
+
+        # hide avatar all the time and show afterwards
+        # so the raycast won't hit the avatar
+        self.avatar.setActive(false)
+        self.tele_space.setActive(false)
+        if self.highlighted_jumpp:
+            self.highlight_jump_point(False)
+            
+        # Hide exluded geometry before raycasting to enable
+        # teleporting through walls etc. Could be improved by using physics layers,
+        # when/if they are implemented. Uses setActive(), because its faster than hideNode()
+        if self.unwalkable_nodes:
+            for node in self.unwalkable_nodes:
+                node.setActive(False)
+
+        rayOri = Pnt3f(cmat[3], cmat[7], cmat[11])
+        rayDir = Vec3f(-cmat[1], -cmat[5], -cmat[9])
+        intersection = getSceneIntersection(-1,rayOri, rayDir)
+
+        if self.unwalkable_nodes:
+            for node in self.unwalkable_nodes:
+                node.setActive(True)
+
+        picked_node = intersection[0]
+        picked_point = intersection[1]
+        if not picked_node or not picked_node.isValid():
+            return
+
+        pick_parent = picked_node.getParent()
+ 
+        if pick_parent.getName()[:len(self.tp_name)] == self.tp_name:
+            self.last_jump_point = self.extract_direction(pick_parent)
+            self.highlight_jump_point(True)
+        elif (picked_node.getName()[:len(self.ground_name)] == self.ground_name 
+                or picked_node.getID() in self.ground_list
+                or hasNodeTag(picked_node, self.ground_tag)):
+            self.avatar.setActive(true)
+            self.tele_space.setActive(true)
+            self.avatar.setTranslation(picked_point.x(), picked_point.y(), picked_point.z())
+            self.avatar.setRotation(0, 0, self.cam_rot_anchor.getWorldRotation()[2])
+            hmd_offset = self.calc_hmd_local_pos()
+            self.tele_space.setTranslation(picked_point.x() - hmd_offset[0], picked_point.y() - hmd_offset[1], picked_point.z())
+            self.last_jump_point = JumpTarget(xyz = [picked_point.x(), picked_point.y(), picked_point.z()])
+        else:
+            self.last_jump_point = None
+
+
+    def raycast_tag(self, tag, contr):
+        '''
+        Add a tag via controller raycast to an object.
+        Can be used to turn tageted nodes into walkable ground
+        or exclude them from raycast targets
+        '''
+        contr.showPickingAxis(False)
+        cmat = contr.getWorldMatrix()
+        rayOri = Pnt3f(cmat[3], cmat[7], cmat[11])
+        rayDir = Vec3f(-cmat[1], -cmat[5], -cmat[9])
+        intersection = getSceneIntersection(-1,rayOri, rayDir)
+
+        if intersection[0] and intersection[0].isValid():
+            addNodeTag(intersection[0], tag)
+
+
+# Script created by Constantin Kleinbeck, supperted by Simon Nagel

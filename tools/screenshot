@@ -1,0 +1,37 @@
+#These Sample scripts are not supported under any Autodesk standard support program or service.
+#The sample scripts are provided without warranty of any kind.
+#Autodesk disclaims all implied warranties including, without limitation, any implied warranties of merchantability or of fitness for a particular purpose.
+#The entire risk arising out of the use or performance of the sample scripts and documentation remains with you.
+
+import os
+
+_editor_code = '''
+
+### Screen Shot Tool Configuration
+selectVariantSet("VRTools_screenshot")
+ss = ScreenSnapper()
+
+controller0 = vrOpenVRController("Controller0")
+controller0.connectSignal("triggerReleased", ss.snap)
+
+controller1 = vrOpenVRController("Controller1")
+controller1.connectSignal("triggerReleased", ss.snap)
+'''
+
+_file = None
+
+class ScreenSnapper():
+
+    def __init__(self, path = os.path.join(os.path.expanduser('~'), 'Desktop')):
+        self.path = path
+        self.filecounter = 0
+
+
+    def snap(self):
+        loaded_file_name = os.path.splitext(os.path.basename(getFileIOFilePath()))[0]
+        filename = os.path.join(self.path, "{}_{}.jpg".format(loaded_file_name, self.filecounter))
+        self.filecounter += 1
+        print filename
+        createScreenshot(filename)
+        
+

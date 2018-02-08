@@ -1,0 +1,171 @@
+#These Sample scripts are not supported under any Autodesk standard support program or service.
+#The sample scripts are provided without warranty of any kind.
+#Autodesk disclaims all implied warranties including, without limitation, any implied warranties of merchantability or of fitness for a particular purpose.
+#The entire risk arising out of the use or performance of the sample scripts and documentation remains with you.
+
+import math
+import colorsys
+
+_editor_code = '''
+
+### Painter Configuration
+selectVariantSet("VRTools_paint")
+p = Painter()
+
+controllers = [vrOpenVRController("Controller0")]
+for controller in controllers:
+    controller.connectSignal("controllerMoved", p.paint, controller)
+    controller.connectSignal("triggerPressed", p.start_painting, controller)
+    controller.connectSignal("triggerReleased", p.stop_painting, controller)
+
+'''
+
+
+_file = None
+
+
+class Painter():
+
+    def __init__(self, pool_size = 1000, min_dist = 10, offset = 0.1, stroke_width = 10):
+        self.pool_size = pool_size
+        self.min_dist = min_dist
+        self.offset = offset;
+        
+        self.pipe_pool = []
+        self.pipe_index = 0
+        self.current_pipe = None
+
+        self.aim_target = None
+        self.pool_counter = 0
+
+        self.stroke_width = stroke_width
+        self.stroke_color = [1, 1, 1]
+        self.drawing = False
+        self.last_draw_point = [0, 0, 0]
+
+        self.reset()
+
+    
+    @staticmethod
+    def distance(a, b):
+        ''' Euclidean distance between 2 points, given as a list of floats '''
+        return math.sqrt((a[0]-b[0]) ** 2 + (a[1]-b[1]) ** 2 + (a[2]-b[2]) ** 2)
+    
+
+    @staticmethod
+    def middle(a, b):
+        ''' Middle etween 2 points, as tuple '''
+        return ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2)
+
+
+    def reset(self, target_size = None):
+        if not target_size:
+            target_size = self.pool_size
+
+        source_node = findNode("toolkit_painter")
+        up = findNode("toolkit_painter_upsource")
+        pipe_pool_group = findNode("toolkit_painter_pipe_pool")
+
+        for node in (source_node, up, pipe_pool_group):
+            if node.isValid():
+                deleteNode(node)
+
+        self.source_node = createNode("Group", "toolkit_painter")
+        self.up = createNode("Group", "toolkit_painter_upsource", self.source_node)
+        self.pipe_pool_group = createNode("Group", "toolkit_painter_pipe_pool", self.source_node)
+
+        self.resize_pool(target_size)
+
+
+    def resize_pool(self, size):
+        ''' Adjusts the paint stroke pool size '''
+        current_size = len(self.pipe_pool)
+        target = size - current_size
+        enableScenegraph(False)
+        for i in range(abs(target)):
+            if target > 0:
+                node = createCylinder(1, 1, 6, True, False, False, 1, 1, 1)
+
+                # Adjust Cylinder Transformations
+                node.setRotation(90, 0, 0)
+                node.setTranslation(0, 0, -0.5)
+                flushTransformations(node)
+                node.setName("toolkit_pipe_" + str(self.pool_counter))
+
+                self.pool_counter += 1
+                self.pipe_pool_group.addChild(node)
+                self.pipe_pool.append(node)
+            elif target < 0:
+                node = self.pipe_pool.pop()
+                deleteNode(node)
+        enableScenegraph(True)
+        updateScenegraph(False)
+
+        # Start over when new size is smaller than current pipe index to avoid out of bounds
+        if size <= self.pipe_index:
+            self.pipe_index = 0
+
+
+    def stroke_width(self, width = 30):
+        ''' Adjust stroke width '''
+        self.stroke_width = width
+
+
+    def stroke_color(self, color):
+        ''' Stroke color, list with [red, green, blue] from 0..1 '''
+        self.stroke_color = color
+
+
+    def place_pipe(self):
+        next_pipe = self.pipe_pool[self.pipe_index]
+        createAimConstraint([self.current_pipe.getName()], [self.up.getName()], next_pipe.getName())
+        self.pipe_index = (self.pipe_index + 1) % len(self.pipe_pool)
+        self.current_pipe = next_pipe
+
+
+    def start_painting(self, controller):
+        self.drawing = True
+        cmat = controller.getWorldMatrix()
+        self.last_draw_point = [cmat[3], cmat[7], cmat[11]]
+
+        # Create a small starting point pipe and immediately after the first real pipe with scaling
+        self.current_pipe = self.pipe_pool[self.pipe_index]
+        self.pipe_index = (self.pipe_index + 1) % len(self.pipe_pool)
+        self.current_pipe.setScale(self.stroke_width, self.stroke_width, 1)
+        self.current_pipe.setTranslation(cmat[3], cmat[7], cmat[11])
+
+        self.place_pipe()
+
+
+    def paint(self, controller):
+        if not self.drawing:
+            return
+
+        cmat = controller.getWorldMatrix()
+        current_pos = [cmat[3], cmat[7], cmat[11]]
+        dist = Painter.distance(self.last_draw_point, current_pos)
+
+        self.current_pipe.setTranslation(cmat[3], cmat[7], cmat[11])
+        self.current_pipe.setScale(self.stroke_width, self.stroke_width, dist + (dist * self.offset))
+
+        tpp = controller.getTouchpadPosition()
+        angle = math.atan2(tpp.x(), tpp.y()) / math.pi
+        hypot = math.hypot(tpp.x(), tpp.y())
+        rgb = colorsys.hsv_to_rgb(angle, hypot, 0.9)
+        self.current_pipe.getMaterial().fields().setVec3f("diffuseColor", *rgb)
+
+        if dist > self.min_dist:
+            self.last_draw_point = current_pos
+            self.place_pipe()
+
+
+    def stop_painting(self, controller):
+        self.drawing = False
+        self.pipe_index = (self.pipe_index + 1) % len(self.pipe_pool)
+        cmat = controller.getWorldMatrix()
+        current_pos = [cmat[3], cmat[7], cmat[11]]
+        self.last_draw_point = current_pos
+
+
+
+
